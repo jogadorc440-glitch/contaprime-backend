@@ -1,0 +1,519 @@
+/**
+ * ContaPrime backend — proxy server-side para a Routeis Partner API,
+ * COM TRAVA DE PAGAMENTO Asaas (Pix).
+ *
+ * REGRA DE OURO (instrução do dono, 2026-10-24):
+ *   O produto só é liberado DEPOIS que o pagamento é confirmado.
+ *   Sem pagamento confirmado, NADA é pedido na Routeis e NADA é
+ *   descontado do saldo do dono.
+ *
+ * Fluxo automático (só para os produtos da tabela SALE_PRICES_CENTS):
+ *   1. Site chama POST /api/payments { productRef, quantity,
+ *      customerName, customerEmail }.
+ *   2. Backend calcula o total com a PRÓPRIA tabela de preços (nunca
+ *      confia no valor que o site manda) e cria a cobrança Pix no Asaas.
+ *   3. Backend devolve o QR Code Pix + copia-e-cola. O cliente paga
+ *      no banco dele. Nada é entregue aqui.
+ *   4. Quando o Asaas confirma, o backend só libera se o status for
+ *      "RECEIVED". "CONFIRMED" NÃO basta: em conta de pessoa física
+ *      o Asaas avisa que CONFIRMED pode ser temporário (bloqueio
+ *      cautelar de até 72h) e depois virar RECEIVED ou REFUNDED.
+ *   5. Só então o backend chama a Routeis com externalOrderId fixo
+ *      `asaas-<paymentId>`: se a entrega já aconteceu, a Routeis
+ *      devolve o MESMO pedido (idempotência) e nunca cobra duas vezes.
+ *
+ * Como o pagamento é confirmado (dois caminhos, o segundo cobre o
+ * primeiro se o webhook falhar ou o Render estiver dormindo):
+ *   - Webhook do Asaas -> POST /api/payments/webhook (evento
+ *     PAYMENT_RECEIVED).
+ *   - O site consulta GET /api/payments/:id/status?productRef=&quantity=
+ *     até o status virar RECEIVED — aí a entrega acontece na hora.
+ *
+ * Produtos FORA da tabela abaixo (Apple TV, Netflix, Disney, HBO Max,
+ * Fornecedores Premium, Método Destrava, Acesso adulto, Lovable Pro
+ * 30 dias +100 créditos) NÃO passam por este Pix automático: eles
+ * continuam no fluxo manual via Telegram, porque a Routeis não os
+ * tem (ou não tem exatamente essa variação). O backend recusa
+ * qualquer tentativa de pagar por eles aqui (PRODUCT_NOT_PRICED).
+ *
+ * Segurança:
+ * - ROUTEIS_API_KEY e ASAAS_API_KEY vêm SÓ de variáveis de ambiente
+ *   do Render. Nunca vão para o site, para o GitHub, para logs ou
+ *   para o chat.
+ * - O endpoint antigo POST /api/orders agora é TRAVADO: sem um
+ *   paymentId do Asaas com status RECEIVED e valor exato, ele
+ *   devolve 402 e não pede nada na Routeis. Isso fecha o buraco
+ *   da versão anterior, que entregava sem pagamento.
+ * - A entrega devolvida é segredo: não a logue, não a guarde em log.
+ *
+ * Variáveis de ambiente (Render):
+ *   ROUTEIS_API_KEY   (obrigatória, como antes)
+ *   ASAAS_API_KEY     (obrigatória para /api/payments)
+ *   ASAAS_BASE_URL    (opcional; padrão produção
+ *                      https://api.asaas.com/v3 — para testar no
+ *                      Sandbox use https://api-sandbox.asaas.com/v3
+ *                      com a chave do Sandbox)
+ *   ASAAS_WEBHOOK_TOKEN (opcional, mas recomendado: o token que você
+ *                      define ao criar o webhook no painel do Asaas;
+ *                      o backend recusa webhooks sem ele, se definido)
+ *   PORT, FRONTEND_ORIGIN (como antes)
+ *
+ * Endpoints:
+ *   GET  /api/health
+ *   GET  /api/catalog
+ *   POST /api/payments          -> cria a cobrança Pix, devolve o QR Code
+ *   GET  /api/payments/:id/status -> consulta e, se RECEIVED, entrega
+ *   POST /api/payments/webhook  -> aviso do Asaas (PAYMENT_RECEIVED)
+ *   POST /api/orders            -> TRAVADO: exige paymentId RECEIVED
+ */
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { RouteisClient, RouteisApiError } from "./routeis-client";
+
+const PORT = Number(process.env.PORT ?? 3001);
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN ?? "*";
+const ASAAS_BASE_URL = (process.env.ASAAS_BASE_URL ?? "https://api.asaas.com/v3").replace(/\/$/, "");
+const ASAAS_WEBHOOK_TOKEN = process.env.ASAAS_WEBHOOK_TOKEN ?? "";
+
+const client = new RouteisClient(); // lê ROUTEIS_API_KEY do ambiente
+
+// ------------------------------------------------------------------ preços
+// Preço de VENDA em centavos (R$), por productRef EXATO da Routeis,
+// conferido no catálogo ao vivo em 2026-10-24. Só estes 7 produtos
+// passam pelo Pix automático. Todo o resto é recusado aqui.
+const SALE_PRICES_CENTS: Record<string, number> = {
+  "Canva Pro 1 Ano": 7000, // R$ 70,00
+  "Canva Pro 30 dias": 1500, // R$ 15,00
+  "Duolingo Super — 12 Months (Link)": 1500, // R$ 15,00
+  "Gemini Pro 18 Meses Link": 1790, // R$ 17,90
+  "Muse AI Account — 10 Billion Tokens": 8000, // R$ 80,00
+  "Muse AI Account — 1 Billion Tokens": 1990, // R$ 19,90
+  "Muse AI Account — 5 Billion Tokens": 5000, // R$ 50,00
+};
+
+// ------------------------------------------------------------------ utils
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": FRONTEND_ORIGIN,
+    "Access-Control-Allow-Headers": "Content-Type, asaas-access-token",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  });
+  res.end(payload);
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  if (chunks.length === 0) return {};
+  return JSON.parse(Buffer.concat(chunks).toString("utf-8")) as Record<string, unknown>;
+}
+
+function asaasKey(): string {
+  const key = process.env.ASAAS_API_KEY ?? "";
+  if (!key) throw new Error("ASAAS_API_KEY is not set.");
+  return key;
+}
+
+async function asaasRequest<T>(
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  const res = await fetch(`${ASAAS_BASE_URL}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "ContaPrime",
+      access_token: asaasKey(),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  const json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  if (!res.ok) {
+    const errors = json.errors as { description?: string }[] | undefined;
+    throw new Error(
+      `Asaas HTTP ${res.status}: ${errors?.[0]?.description ?? "erro na API do Asaas."}`,
+    );
+  }
+  return json as T;
+}
+
+interface AsaasPayment {
+  id: string;
+  status: string;
+  value: number;
+  billingType: string;
+}
+
+interface AsaasQrCode {
+  encodedImage?: string;
+  payload?: string;
+  expirationDate?: string;
+}
+
+function tomorrowDate(): string {
+  const d = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+// ------------------------------------------------------- pedidos pendentes
+interface Pending {
+  paymentId: string;
+  productRef: string;
+  quantity: number;
+  totalCents: number;
+  externalOrderId: string;
+  deliveredOrder?: Record<string, unknown>;
+}
+
+const pendingByPayment = new Map<string, Pending>();
+const processedWebhookEvents = new Set<string>();
+
+function getOrRebuildPending(
+  paymentId: string,
+  productRef: string,
+  quantity: number,
+): Pending | null {
+  const existing = pendingByPayment.get(paymentId);
+  if (existing) return existing;
+  // O Render gratuito dorme e pode reiniciar perdendo a memória: o site
+  // sempre manda productRef + quantity na consulta, então dá para
+  // reconstruir o pedido. O externalOrderId é derivado do paymentId,
+  // então mesmo reconstruído a Routeis nunca cobra duas vezes.
+  const unit = SALE_PRICES_CENTS[productRef];
+  if (unit === undefined || !Number.isInteger(quantity) || quantity < 1) return null;
+  const rebuilt: Pending = {
+    paymentId,
+    productRef,
+    quantity,
+    totalCents: unit * quantity,
+    externalOrderId: `asaas-${paymentId}`,
+  };
+  pendingByPayment.set(paymentId, rebuilt);
+  return rebuilt;
+}
+
+async function deliver(pending: Pending): Promise<Record<string, unknown>> {
+  if (pending.deliveredOrder) return pending.deliveredOrder;
+  const order = await client.createOrder(
+    pending.productRef,
+    pending.quantity,
+    pending.externalOrderId,
+  );
+  const delivered = {
+    ok: true,
+    orderCode: order.orderCode,
+    externalOrderId: order.externalOrderId,
+    status: order.status,
+    product: order.product,
+    quantity: order.quantity,
+    unitPrice: order.unitPrice,
+    totalCharged: order.totalCharged,
+    currency: order.currency,
+    isReplay: order.isReplay,
+    deliveryContents: order.deliveryContents,
+  };
+  pending.deliveredOrder = delivered;
+  return delivered;
+}
+
+// ------------------------------------------------------------------ servidor
+const server = createServer(async (req, res) => {
+  try {
+    if (req.method === "OPTIONS") {
+      sendJson(res, 204, {});
+      return;
+    }
+    const url = new URL(req.url ?? "/", "http://localhost");
+
+    if (req.method === "GET" && url.pathname === "/api/health") {
+      sendJson(res, 200, await client.health());
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/catalog") {
+      const catalog = await client.listProducts({ description: true });
+      sendJson(res, 200, {
+        locale: catalog.meta.locale,
+        data: catalog.data.map((p) => ({
+          id: p.id,
+          productRef: p.productRef,
+          name: p.name,
+          price: p.price,
+          currency: p.currency,
+          deliveryType: p.deliveryType,
+          description: p.description,
+          stock: p.stock,
+        })),
+      });
+      return;
+    }
+
+    // ------------------------------------------------ POST /api/payments
+    if (req.method === "POST" && url.pathname === "/api/payments") {
+      const body = await readJson(req);
+      const productRef = typeof body.productRef === "string" ? body.productRef : "";
+      const quantity = typeof body.quantity === "number" ? body.quantity : 1;
+      const customerName = typeof body.customerName === "string" ? body.customerName.trim() : "";
+      const customerEmail = typeof body.customerEmail === "string" ? body.customerEmail.trim() : "";
+      const customerCpfCnpj =
+        typeof body.customerCpfCnpj === "string" ? body.customerCpfCnpj.trim() : undefined;
+      const unit = SALE_PRICES_CENTS[productRef];
+      if (unit === undefined) {
+        sendJson(res, 400, {
+          ok: false,
+          error: {
+            code: "PRODUCT_NOT_PRICED",
+            message:
+              "Este produto não passa pelo Pix automático (é manual, via Telegram).",
+          },
+        });
+        return;
+      }
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
+        sendJson(res, 400, {
+          ok: false,
+          error: { code: "INVALID_QUANTITY", message: "Quantidade inválida (1 a 10)." },
+        });
+        return;
+      }
+      if (!customerName || !customerEmail) {
+        sendJson(res, 400, {
+          ok: false,
+          error: { code: "INVALID_REQUEST", message: "Nome e e-mail do cliente são obrigatórios." },
+        });
+        return;
+      }
+      if (!process.env.ASAAS_API_KEY) {
+        sendJson(res, 503, {
+          ok: false,
+          error: { code: "ASAAS_NOT_CONFIGURED", message: "Pagamento ainda não configurado no servidor." },
+        });
+        return;
+      }
+      const totalCents = unit * quantity;
+      const customer = await asaasRequest<{ id: string }>("POST", "/customers", {
+        name: customerName,
+        email: customerEmail,
+        ...(customerCpfCnpj ? { cpfCnpj: customerCpfCnpj } : {}),
+      });
+      const payment = await asaasRequest<AsaasPayment>("POST", "/payments", {
+        customer: customer.id,
+        billingType: "PIX",
+        value: totalCents / 100,
+        dueDate: tomorrowDate(),
+        description: `ContaPrime - ${productRef} x${quantity}`,
+      });
+      // QR Code Pix (copia-e-cola + imagem). Se o Asaas ainda não tiver
+      // gerado, o site consulta o status depois; não é erro fatal aqui.
+      let qr: AsaasQrCode | null = null;
+      try {
+        qr = await asaasRequest<AsaasQrCode>("GET", `/payments/${payment.id}/pixQrCode`);
+      } catch {
+        qr = null;
+      }
+      pendingByPayment.set(payment.id, {
+        paymentId: payment.id,
+        productRef,
+        quantity,
+        totalCents,
+        externalOrderId: `asaas-${payment.id}`,
+      });
+      sendJson(res, 200, {
+        ok: true,
+        paymentId: payment.id,
+        productRef,
+        quantity,
+        totalBRL: totalCents / 100,
+        status: payment.status,
+        pixPayload: qr?.payload ?? null,
+        pixEncodedImage: qr?.encodedImage ?? null,
+        pixExpiration: qr?.expirationDate ?? null,
+      });
+      return;
+    }
+
+    // --------------------------------------- GET /api/payments/:id/status
+    const statusMatch = url.pathname.match(/^\/api\/payments\/([^/]+)\/status$/);
+    if (req.method === "GET" && statusMatch) {
+      const paymentId = decodeURIComponent(statusMatch[1]);
+      const productRef = url.searchParams.get("productRef") ?? "";
+      const quantity = Number(url.searchParams.get("quantity") ?? "1");
+      if (!process.env.ASAAS_API_KEY) {
+        sendJson(res, 503, {
+          ok: false,
+          error: { code: "ASAAS_NOT_CONFIGURED", message: "Pagamento ainda não configurado no servidor." },
+        });
+        return;
+      }
+      const payment = await asaasRequest<AsaasPayment>("GET", `/payments/${paymentId}`);
+      // RECEIVED é o único status que libera. CONFIRMED pode ser
+      // temporário em conta de pessoa física (até 72h de análise).
+      if (payment.status !== "RECEIVED") {
+        sendJson(res, 200, {
+          ok: true,
+          paymentId,
+          status: payment.status,
+          delivered: false,
+        });
+        return;
+      }
+      const pending = getOrRebuildPending(paymentId, productRef, quantity);
+      if (!pending) {
+        sendJson(res, 400, {
+          ok: false,
+          error: {
+            code: "PENDING_NOT_FOUND",
+            message: "Pedido não localizado: informe productRef e quantity na consulta.",
+          },
+        });
+        return;
+      }
+      if (Math.round(payment.value * 100) !== pending.totalCents) {
+        sendJson(res, 402, {
+          ok: false,
+          error: { code: "PAYMENT_VALUE_MISMATCH", message: "Valor pago não confere com o pedido." },
+        });
+        return;
+      }
+      try {
+        const delivered = await deliver(pending);
+        sendJson(res, 200, { ok: true, paymentId, status: payment.status, delivered: true, ...delivered });
+      } catch (err) {
+        // Pago mas sem entrega (ex.: sem saldo ou sem estoque na
+        // Routeis): NÃO marca como entregue, para tentar de novo
+        // depois — e o cliente deve falar com o atendimento.
+        if (err instanceof RouteisApiError) {
+          console.error(`Entrega pós-pagamento falhou [${err.code}]`);
+          sendJson(res, 502, {
+            ok: false,
+            error: {
+              code: "PAID_NOT_DELIVERED",
+              message:
+                "Pagamento confirmado, mas a entrega falhou no fornecedor. Fale com o atendimento no Telegram informando o paymentId.",
+              routeisCode: err.code,
+              paymentId,
+            },
+          });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    // ------------------------------------------ POST /api/payments/webhook
+    if (req.method === "POST" && url.pathname === "/api/payments/webhook") {
+      if (ASAAS_WEBHOOK_TOKEN) {
+        const token = req.headers["asaas-access-token"];
+        if (token !== ASAAS_WEBHOOK_TOKEN) {
+          sendJson(res, 401, { ok: false, error: { code: "UNAUTHORIZED", message: "Token do webhook inválido." } });
+          return;
+        }
+      }
+      const body = await readJson(req);
+      const event = typeof body.event === "string" ? body.event : "";
+      const eventId = typeof body.id === "string" ? body.id : "";
+      const paymentObj = body.payment as { id?: string } | undefined;
+      const paymentId = paymentObj?.id ?? "";
+      // Responda 200 sempre após a autenticação: o Asaas reenvia
+      // eventos sem 200, e a entrega também acontece pela consulta
+      // de status — o webhook é um atalho, não o único caminho.
+      if (event !== "PAYMENT_RECEIVED" || !paymentId) {
+        sendJson(res, 200, { ok: true, ignored: true });
+        return;
+      }
+      if (eventId && processedWebhookEvents.has(eventId)) {
+        sendJson(res, 200, { ok: true, duplicate: true });
+        return;
+      }
+      if (eventId) processedWebhookEvents.add(eventId);
+      const pending = pendingByPayment.get(paymentId);
+      if (!pending) {
+        // Servidor reiniciou ou o pedido veio de outra instância: a
+        // consulta de status do site (com productRef) resolve.
+        sendJson(res, 200, { ok: true, pending: "unknown" });
+        return;
+      }
+      try {
+        await deliver(pending);
+      } catch (err) {
+        if (err instanceof RouteisApiError) {
+          console.error(`Entrega via webhook falhou [${err.code}]`);
+        }
+      }
+      sendJson(res, 200, { ok: true, delivered: pending.deliveredOrder !== undefined });
+      return;
+    }
+
+    // --------------------------------------- POST /api/orders (TRAVADO)
+    if (req.method === "POST" && url.pathname === "/api/orders") {
+      const body = await readJson(req);
+      const paymentId = typeof body.paymentId === "string" ? body.paymentId : "";
+      const productRef = typeof body.productRef === "string" ? body.productRef : "";
+      const quantity = typeof body.quantity === "number" ? body.quantity : 1;
+      if (!paymentId) {
+        sendJson(res, 402, {
+          ok: false,
+          error: {
+            code: "PAYMENT_REQUIRED",
+            message: "Este endpoint agora exige um pagamento Asaas confirmado (paymentId).",
+          },
+        });
+        return;
+      }
+      if (!process.env.ASAAS_API_KEY) {
+        sendJson(res, 503, {
+          ok: false,
+          error: { code: "ASAAS_NOT_CONFIGURED", message: "Pagamento ainda não configurado no servidor." },
+        });
+        return;
+      }
+      const payment = await asaasRequest<AsaasPayment>("GET", `/payments/${paymentId}`);
+      if (payment.status !== "RECEIVED") {
+        sendJson(res, 402, {
+          ok: false,
+          error: { code: "PAYMENT_NOT_CONFIRMED", message: `Pagamento ainda não confirmado (status: ${payment.status}).` },
+        });
+        return;
+      }
+      const pending = getOrRebuildPending(paymentId, productRef, quantity);
+      if (!pending) {
+        sendJson(res, 400, {
+          ok: false,
+          error: { code: "PENDING_NOT_FOUND", message: "Produto ou quantidade inválidos para este pagamento." },
+        });
+        return;
+      }
+      if (Math.round(payment.value * 100) !== pending.totalCents) {
+        sendJson(res, 402, {
+          ok: false,
+          error: { code: "PAYMENT_VALUE_MISMATCH", message: "Valor pago não confere com o pedido." },
+        });
+        return;
+      }
+      const delivered = await deliver(pending);
+      sendJson(res, 200, delivered);
+      return;
+    }
+
+    sendJson(res, 404, { ok: false, error: { code: "NOT_FOUND", message: "Rota não encontrada." } });
+  } catch (err) {
+    if (err instanceof RouteisApiError) {
+      console.error(`Routeis [${err.code}] HTTP ${err.status}`);
+      sendJson(res, err.status || 500, {
+        ok: false,
+        error: { code: err.code, message: err.message, requestId: err.requestId },
+      });
+      return;
+    }
+    console.error("Erro interno no backend.");
+    sendJson(res, 500, { ok: false, error: { code: "INTERNAL_ERROR", message: "Erro interno." } });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`ContaPrime backend ouvindo na porta ${PORT} (chaves lidas do ambiente, nunca expostas).`);
+});
