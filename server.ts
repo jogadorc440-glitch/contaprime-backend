@@ -58,6 +58,12 @@
  *                      o backend recusa webhooks sem ele, se definido)
  *   PORT, FRONTEND_ORIGIN (como antes)
  *
+ * v3 (2026-10-24, diagnóstico): o erro do Asaas agora aparece de
+ * verdade na resposta (código ASAAS_ERROR + descrição do Asaas, sem
+ * chave) e no log do Render, em vez de virar só "Erro interno".
+ * Também reutiliza o cliente do Asaas pelo e-mail, para não criar
+ * um cliente novo a cada tentativa de Pix.
+ *
  * Endpoints:
  *   GET  /api/health
  *   GET  /api/catalog
@@ -294,13 +300,28 @@ const server = createServer(async (req, res) => {
         return;
       }
       const totalCents = unit * quantity;
-      const customer = await asaasRequest<{ id: string }>("POST", "/customers", {
-        name: customerName,
-        email: customerEmail,
-        ...(customerCpfCnpj ? { cpfCnpj: customerCpfCnpj } : {}),
-      });
+      // Reutiliza o cliente pelo e-mail, se já existir, para não
+      // criar um cliente novo a cada tentativa de Pix.
+      let customerId: string | null = null;
+      try {
+        const found = await asaasRequest<{ data?: { id: string }[] }>(
+          "GET",
+          `/customers?email=${encodeURIComponent(customerEmail)}`,
+        );
+        if (found.data && found.data.length > 0) customerId = found.data[0].id;
+      } catch {
+        customerId = null; // busca falhou: segue criando o cliente
+      }
+      if (!customerId) {
+        const customer = await asaasRequest<{ id: string }>("POST", "/customers", {
+          name: customerName,
+          email: customerEmail,
+          ...(customerCpfCnpj ? { cpfCnpj: customerCpfCnpj } : {}),
+        });
+        customerId = customer.id;
+      }
       const payment = await asaasRequest<AsaasPayment>("POST", "/payments", {
-        customer: customer.id,
+        customer: customerId,
         billingType: "PIX",
         value: totalCents / 100,
         dueDate: tomorrowDate(),
@@ -506,6 +527,16 @@ const server = createServer(async (req, res) => {
       sendJson(res, err.status || 500, {
         ok: false,
         error: { code: err.code, message: err.message, requestId: err.requestId },
+      });
+      return;
+    }
+    // v3: mostra o erro REAL do Asaas (status + descrição, sem chave)
+    // na resposta e no log, em vez de esconder tudo como "interno".
+    if (err instanceof Error && err.message.startsWith("Asaas HTTP")) {
+      console.error(`Asaas: ${err.message}`);
+      sendJson(res, 502, {
+        ok: false,
+        error: { code: "ASAAS_ERROR", message: err.message },
       });
       return;
     }
