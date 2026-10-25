@@ -63,6 +63,11 @@
  * chave) e no log do Render, em vez de virar só "Erro interno".
  * Também reutiliza o cliente do Asaas pelo e-mail, para não criar
  * um cliente novo a cada tentativa de Pix.
+ * v4 (2026-10-24, correção do bug da v3): ao reutilizar um cliente
+ * já existente, ATUALIZA o CPF/CNPJ dele antes de criar a cobrança.
+ * Sem isso, um cliente criado antes sem CPF (ex.: nas tentativas
+ * sem o campo CPF) continuava sem CPF e o Asaas recusava a cobrança
+ * mesmo com o CPF digitado no checkout novo.
  *
  * Endpoints:
  *   GET  /api/health
@@ -122,7 +127,7 @@ function asaasKey(): string {
 }
 
 async function asaasRequest<T>(
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PUT",
   path: string,
   body?: unknown,
 ): Promise<T> {
@@ -319,6 +324,20 @@ const server = createServer(async (req, res) => {
           ...(customerCpfCnpj ? { cpfCnpj: customerCpfCnpj } : {}),
         });
         customerId = customer.id;
+      } else if (customerCpfCnpj) {
+        // Cliente antigo pode ter sido criado SEM CPF (tentativas
+        // antes do campo CPF): atualiza o CPF dele, senão o Asaas
+        // continua recusando a cobrança mesmo com CPF no checkout.
+        try {
+          await asaasRequest("PUT", `/customers/${customerId}`, {
+            name: customerName,
+            email: customerEmail,
+            cpfCnpj: customerCpfCnpj,
+          });
+        } catch {
+          // Se a atualização falhar, segue com o cliente antigo:
+          // a criação da cobrança vai devolver o erro real do Asaas.
+        }
       }
       const payment = await asaasRequest<AsaasPayment>("POST", "/payments", {
         customer: customerId,
