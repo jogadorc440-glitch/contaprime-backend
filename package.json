@@ -1,0 +1,1 @@
+{"dependencies":{"nodemailer":"^6.9.14","tsx":"^4.0.0"},"name":"contaprime-backend","scripts":{"start":"tsx server.ts"},"type":"module"}
